@@ -1,0 +1,119 @@
+name: IEX HIST bars
+
+# Builds data/iex/bars/YYYY-MM-DD.json.gz (1-minute bars for the licensed mode) from IEX's free
+# T+1 TOPS download. Each day is ~16 GB compressed, streamed and never stored, ~10-20 min per day.
+
+on:
+  schedule:
+    # IEX posts the previous trading day around 12:00 UTC. Two tries, Tue-Sat.
+    - cron: "17 12 * * 2-6"
+    - cron: "47 12 * * 2-6"
+  workflow_dispatch:
+    inputs:
+      range:
+        description: "Days to build, YYYY-MM-DD:YYYY-MM-DD (IEX keeps ~12 months). Blank = previous trading day."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: iex-hist
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      days: ${{ steps.p.outputs.days }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: data/iex
+      - id: p
+        env:
+          RANGE: ${{ github.event.inputs.range }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          from datetime import date, datetime, timedelta, timezone
+          from pathlib import Path
+          r = os.environ.get("RANGE", "").strip()
+          if r:
+              a, b = (date.fromisoformat(x) for x in r.split(":")) if ":" in r else (date.fromisoformat(r),) * 2
+          else:
+              b = datetime.now(timezone.utc).date() - timedelta(days=1)
+              while b.weekday() >= 5:
+                  b -= timedelta(days=1)
+              a = b
+          have = {p.name.split(".")[0] for p in Path("data/iex/bars").glob("*.json.gz")}
+          days, d = [], a
+          while d <= b:
+              if d.weekday() < 5 and d.isoformat() not in have:
+                  days.append(d.isoformat())
+              d += timedelta(days=1)
+          print("days=" + json.dumps(days[:250]))
+          PY
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.days != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        day: ${{ fromJson(needs.plan.outputs.days) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+      - run: sudo apt-get install -y pigz >/dev/null && pip install requests
+      - name: Parse ${{ matrix.day }}
+        run: python scripts/iex_hist.py ${{ matrix.day }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bars-${{ matrix.day }}
+          path: data/iex/bars/*.json.gz
+          if-no-files-found: ignore
+          retention-days: 3
+
+  publish:
+    needs: build
+    if: always() && needs.build.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bars-*
+          path: data/iex/bars
+          merge-multiple: true
+      - name: Index
+        run: |
+          python3 - <<'PY'
+          import gzip, json
+          from pathlib import Path
+          idx = {}
+          for p in sorted(Path("data/iex/bars").glob("*.json.gz")):
+              js = json.load(gzip.open(p, "rt"))
+              idx[p.name.split(".")[0]] = {"trades": js.get("trades"), "symbols": len(js.get("bars", {}))}
+          Path("data/iex/index.json").write_text(json.dumps(idx, indent=1))
+          print(len(idx), "days")
+          PY
+      - name: Commit
+        run: |
+          git config user.name  "bias-bot"
+          git config user.email "bias-bot@users.noreply.github.com"
+          git add data/iex
+          git diff --cached --quiet && echo "No new days" && exit 0
+          git commit -m "IEX bars $(date -u +%Y-%m-%d)"
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            if git rebase origin/main && git push origin HEAD:main; then exit 0; fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((i * 5))
+          done
+          exit 1
